@@ -1,6 +1,6 @@
 import subprocess
 import threading
-import Queue
+import queue
 import time
 import os.path
 
@@ -12,14 +12,21 @@ class Service(threading.Thread):
 	
 	def __init__(self, config):
 		
-		self.msgQ = Queue.Queue()
+		self.msgQ = queue.Queue()
 		self._stop = threading.Event()
 		self.processRunning = False
 		self.processStarted = False
 		self.processTerminated = False
 		threading.Thread.__init__(self)
 
+		# Pass dictionary config in
 		self.config = config
+		
+		self.name = self.config["name"]
+		if "description" in self.config:
+			self.description = self.config["description"]
+		else:
+			self.description = ""
 		
 		# parse cmd to pull args delimited by spaces
 		self.config["args"] = self.config["cmd"].split(" ")	

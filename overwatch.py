@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 # manager for entire project or system
 # manages subprocess and their dependencies
@@ -8,37 +8,37 @@
 
 import sys, os
 import time
-import urlparse
 import paho.mqtt.client as paho
 import json
 from fnmatch import fnmatch
 import re
+import queue
 
 import service
 
 class Overwatch(object):
 	
 	def __init__(self):
-
+		self.mqttMessageQueue = queue.Queue()
 		self.config = {}
 		self.services = []
 		self.configured = False
 		self.status = {}
 		self.lastStatus = None
 		
+		self.loadConfig()
+		self.connectToBroker()
+		self.startServices()
+		self.run()
+		
 	def loadConfig(self, config_file="config.json"):
-
 		# Load JSON configuration from disk
 		with open(config_file) as data_file:
 		    self.config = json.load(data_file)
-		self.services = self.config["services"]
 		
 		self.configured = True
-		
-		self.connectToBroker()
 
 	def connectToBroker(self):
-		
 		# Create and initialize MQTT Client
 		self.mqttc = paho.Client(self.config["mqttClientName"])
 		self.mqttc.on_message = self.on_MqttMessage
@@ -46,37 +46,62 @@ class Overwatch(object):
 		self.mqttc.on_publish = self.on_MqttPublish
 		self.mqttc.on_subscribe = self.on_MqttSubscribe
 
-		if self.configured:
-			# Parse CLOUDMQTT_URL (or fallback to localhost)
-			url_str = os.environ.get('CLOUDMQTT_URL', 'mqtt://' + self.config["mqttRemoteHost"] + ":" + str(self.config["mqttRemotePort"]))
-			url = urlparse.urlparse(url_str)
-			
+		if self.configured:	
 			# Initialize and begin MQTT
 			#mqttc.username_pw_set(url.username, url.password)
 			self.mqttc.will_set('clients/' + self.config["mqttClientName"], 'offline', 0, False)
-			self.mqttc.connect(url.hostname, url.port)
+			self.mqttc.connect(self.config["mqttRemoteHost"], self.config["mqttRemotePort"])
+			self.mqttc.loop_start()
 			return False
 		else:
 			print("MQTT settings are not configured; unable to connect")
 			sys.exit()
 
-	# Define event callbacks
+	# MQTT Client has successfully connected
+	# do testing to ensure that this cross-thread call
+	# is safe
 	def on_MqttConnect(self, something, mosq, obj, rc):
 		self.mqttc.publish("clients/" + self.config["mqttClientName"] + "/status", 'healthy')
-		self.mqttc.subscribe("clients/#") # what qos do we want?
+		self.mqttc.subscribe("clients/#")
+		self.mqttc.subscribe("clients/{0}/cmd/#".format(self.config["mqttClientName"]))
 	
+	# MQTT Client has received a message
 	def on_MqttMessage(self, mosq, obj, msg):
-	
-		if (fnmatch(msg.topic, 'clients/+/status') == True):
-			print("brief status")
-			# client status received
-			pass
-	
-		if (fnmatch(msg.topic, 'clients/+/fullstatus') == True):
-			print("full status")
-			pass
-	
-		#print(msg.topic + " " + str(msg.qos) + " " + str(msg.payload))
+		topic = msg.topic
+		payload = msg.payload.decode('utf-8')
+		
+		# place message as tuple in a thread-safe queue 
+		# as this was called from the mqtt loop thread
+		self.mqttMessageQueue.put((topic,payload))
+		
+	def processMqttMessages(self):
+
+		while not self.mqttMessageQueue.empty():			
+			(topic,payload) = self.mqttMessageQueue.get()
+
+			if topic == "clients/{0}/cmd".format(self.config["mqttClientName"]):
+				try: command = json.loads(payload)
+				except: self.writeLog("unable to process json from command: {0}".format(payload))
+					
+				if command['command'] == 'service-restart':
+					pass
+					
+				if command['command'] == 'shutdown':
+					print("Received request to shutdown from MQTT")
+					self.shutdown()
+					
+				if command['command'] == 'restart':
+					pass # stub
+					
+					
+			if (fnmatch(topic, 'clients/+/status') == True):
+				print("brief status")
+				# client status received
+				pass
+		
+			if (fnmatch(topic, 'clients/+/fullstatus') == True):
+				print("full status")
+				pass
 	
 	def on_MqttPublish(self, mosq, obj, mid):
 	    pass
@@ -84,38 +109,69 @@ class Overwatch(object):
 	def on_MqttSubscribe(self, mosq, obj, mid, granted_qos):
 	    pass
 
-	def mqttcLog(self, message, level = "debug"):
+	def writeLog(self, message, level = "debug"):
 		self.mqttc.publish("logs/" + self.config["mqttClientName"] + "/" + level.lower(), message)
+	
+	def startService(self, name):
+		found = False
+		for s in self.services:
+			if s.name == name:
+				found = True
+				self.writeLog("starting service {0}".format(name))
+				s.startProcess()
+		
+		if not found:
+			self.writeLog("requested service does not exist to start {0}".format(name))
+		
+	def stopService(self, name):
+		found = False
+		for s in self.services:
+			if s.name == name:
+				found = True
+				self.writeLog("stopping service {0}".format(name))
+				s.stopProcess()
+		
+		if not found:
+			self.writeLog("requested service does not exist to stop {0}".format(name))
+		
+	def restartService(self, name):
+		self.stopService(name)
+		self.startService(name)
 	
 	def startServices(self):
 		
-		print("Overwatch: Starting {0} services".format(len(self.services)))
+		print("Starting {0} services".format(len(self.config["services"])))
 
 		# Start up modules
-		self.serviceThreads = [] # for tracking
-		for s in self.services:
+		self.services.clear()
+		for s in self.config["services"]:
+			# Create new service and pass config dictionary
 			t = service.Service(s)
+			self.services.append(t)
 			t.start()
-			self.serviceThreads.append(t)
 
+	# Shut down entire application
 	def shutdown(self):
+		print("Shutting down..")
 		self.stopServices()
+		self.mqttc.loop_stop()
+		sys.exit(True)
 
 	def stopServices(self):
-		for thread in self.serviceThreads:
-			thread.stop()
+		for s in self.services:
+			s.stop()
 			
 	def checkServices(self):
 		# remember, some services may be disabled and not
 		# intended to be running
-		for s in self.serviceThreads:
-		
+		for s in self.services:
+
 			# process thread born messages to 
 			# pass to logging facility
 			if not s.msgQ.empty():
 				msg = s.msgQ.get(False)
 				s.msgQ.task_done()
-				self.mqttcLog(msg)
+				self.writeLog(msg)
 	
 			# if process should be running but is not
 			# lets restart it while being careful not to flap
@@ -127,7 +183,7 @@ class Overwatch(object):
 			# we need to watch this rather infrequently
 			if not s.watchmtime == None:
 				if os.stat(s.config["reload_watch"]).st_mtime > s.watchmtime:
-					self.mqttcLog("{0}: detected modification in watched file ({1}); Restarting".format(s.config["name"],s.config["reload_watch"]), "notice")
+					self.writeLog("{0}: detected modification in watched file ({1}); Restarting".format(s.config["name"],s.config["reload_watch"]), "notice")
 					s.restartProcess()
 	
 	def publishServiceStatus(self):
@@ -143,37 +199,26 @@ class Overwatch(object):
 			self.status["services"] = serviceStatuses
 			self.lastStatus = self.status
 			self.mqttc.publish("overwatch/status/services", json.dumps(serviceStatuses))
-		
-
+			
+			
 	def run(self):
 		try:
 			while True:
 		
+				self.processMqttMessages()
 				# check status of services
 				# todo, these are already threads
 				# they could be checking themselves
 				self.checkServices()
 				
-				self.publishServiceStatus()
+				#self.publishServiceStatus()
 		
-				# service mqttc network loop
-				# timeout 10 mS as it is blocking
-				self.mqttc.loop(0.01)
+				# not sure we need to do anything
+				# faster than 10 Hz
+				time.sleep(0.1)
 		
 		except (KeyboardInterrupt, SystemExit):
-		
-			print("Received keyboard interrupt in Overwatch::run()\r\nShutting down..")
+			print("Received keyboard interrupt in Overwatch")
 			self.shutdown()
-			return False
 
-def main():
-	
-	overwatch = Overwatch()
-	overwatch.loadConfig()
-	overwatch.startServices()
-	overwatch.run()
-	
-	return False
-
-if __name__ == "__main__":
-    sys.exit(main())
+overwatch = Overwatch()
