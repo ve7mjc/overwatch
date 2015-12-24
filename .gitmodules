@@ -1,0 +1,3 @@
+[submodule "c3lib"]
+	path = c3lib
+	url = git@bitbucket.org:crosswalkguy/c3lib.git
